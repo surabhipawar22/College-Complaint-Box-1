@@ -1,6 +1,6 @@
 import os
-import psycopg
-import psycopg.extras
+import psycopg2
+import psycopg2.extras
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
@@ -53,13 +53,13 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_db():
-    """Open and return a new psycopg connection."""
+    """Open and return a new psycopg2 connection."""
     if not DATABASE_URL:
         raise RuntimeError(
             "DATABASE_URL is not set. "
             "Add it to your .env file (local) or Vercel environment variables (production)."
         )
-    return psycopg.connect(DATABASE_URL, cursor_factory=psycopg.extras.RealDictCursor)
+    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
 
 
 def init_db():
