@@ -1,72 +1,97 @@
 import os
-import psycopg2
-import psycopg2.extras
+import pg8000
+import pg8000.native
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Load .env automatically when running locally (ignored on Vercel)
-# ─────────────────────────────────────────────────────────────────────────────
+# Load .env when running locally (ignored on Vercel)
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass   # python-dotenv not strictly required on Vercel
+    pass
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Flask app
+#  Flask app — static + template folders relative to this file
 # ─────────────────────────────────────────────────────────────────────────────
-app = Flask(__name__, static_folder="static", template_folder="templates")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+app = Flask(
+    __name__,
+    static_folder=os.path.join(BASE_DIR, "static"),
+    static_url_path="/static",
+    template_folder=os.path.join(BASE_DIR, "templates"),
+)
 CORS(app)
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  ██████╗  █████╗ ████████╗ █████╗ ██████╗  █████╗ ███████╗███████╗
-#  ██╔══██╗██╔══██╗╚══██╔══╝██╔══██╗██╔══██╗██╔══██╗██╔════╝██╔════╝
-#  ██║  ██║███████║   ██║   ███████║██████╔╝███████║███████╗█████╗
-#  ██║  ██║██╔══██║   ██║   ██╔══██║██╔══██╗██╔══██║╚════██║██╔══╝
-#  ██████╔╝██║  ██║   ██║   ██║  ██║██████╔╝██║  ██║███████║███████╗
-#  ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝╚══════╝╚══════╝
+#  DATABASE CONFIGURATION
+#  ─────────────────────────────────────────────────────────────────────────
+#  Set DATABASE_URL in:
+#    • Local dev  →  create a .env file in this folder
+#    • Vercel     →  Dashboard → Project → Settings → Environment Variables
 #
-#  HOW TO CONNECT YOUR DATABASE
-#  ─────────────────────────────
-#  1. Create a free project at https://supabase.com
-#  2. Go to: Project → Settings → Database → Connection string → URI
-#  3. Copy the URI (looks like the string below) and paste it in ONE of:
-#
-#     a) Local development  →  create a file called  .env  in this folder:
-#           DATABASE_URL=postgresql://postgres:YOUR_PASSWORD@db.xxxx.supabase.co:5432/postgres
-#
-#     b) Vercel deployment  →  Vercel dashboard → your project → Settings → Environment Variables
-#           Key:   DATABASE_URL
-#           Value: postgresql://postgres:YOUR_PASSWORD@db.xxxx.supabase.co:5432/postgres
-#
-#  The DATABASE_URL below is read automatically from whichever source you choose.
-#  You never need to hard-code credentials here.
+#  Format:
+#    postgresql://postgres:YOUR_PASSWORD@db.YOUR_PROJECT.supabase.co:5432/postgres
 # ═════════════════════════════════════════════════════════════════════════════
 
-DATABASE_URL   = os.environ.get("DATABASE_URL")          # ← set in .env or Vercel dashboard
+DATABASE_URL   = os.environ.get("DATABASE_URL", "")
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Database helpers
+#  Database helpers  (pg8000 — pure Python, works on Vercel)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def parse_db_url(url):
+    """Parse a postgresql:// URI into pg8000.connect() kwargs."""
+    # Remove scheme
+    url = url.replace("postgresql://", "").replace("postgres://", "")
+    # userinfo@host/dbname
+    userinfo, rest = url.split("@", 1)
+    user, password  = userinfo.split(":", 1)
+    hostpart, dbname = rest.split("/", 1)
+    if ":" in hostpart:
+        host, port = hostpart.split(":", 1)
+        port = int(port)
+    else:
+        host = hostpart
+        port = 5432
+    # strip query params from dbname if present
+    dbname = dbname.split("?")[0]
+    return dict(host=host, port=port, user=user, password=password, database=dbname, ssl_context=True)
+
+
 def get_db():
-    """Open and return a new psycopg2 connection."""
+    """Return a new pg8000 connection."""
     if not DATABASE_URL:
         raise RuntimeError(
             "DATABASE_URL is not set. "
-            "Add it to your .env file (local) or Vercel environment variables (production)."
+            "Add it to Vercel → Settings → Environment Variables."
         )
-    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    kwargs = parse_db_url(DATABASE_URL)
+    return pg8000.connect(**kwargs)
+
+
+def fetchall_as_dicts(cursor):
+    """Convert pg8000 rows (tuples) + cursor.description → list of dicts."""
+    if cursor.description is None:
+        return []
+    cols = [d[0] for d in cursor.description]
+    return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+
+def fetchone_as_dict(cursor):
+    """Convert a single pg8000 row to a dict."""
+    if cursor.description is None:
+        return None
+    cols = [d[0] for d in cursor.description]
+    row  = cursor.fetchone()
+    return dict(zip(cols, row)) if row else None
 
 
 def init_db():
-    """
-    Create the 'complaints' table if it does not already exist.
-    Called once on startup — safe to run multiple times.
-    """
+    """Create the complaints table if it doesn't exist."""
     conn = get_db()
     cur  = conn.cursor()
     cur.execute("""
@@ -79,7 +104,7 @@ def init_db():
             description TEXT         NOT NULL,
             status      VARCHAR(20)  NOT NULL DEFAULT 'pending',
             created_at  TIMESTAMP    NOT NULL DEFAULT NOW()
-        );
+        )
     """)
     conn.commit()
     cur.close()
@@ -87,18 +112,16 @@ def init_db():
     print("[DB] Table ready.")
 
 
-# Run once on cold start
 try:
     init_db()
 except Exception as exc:
-    # Don't crash if DATABASE_URL is missing at import time (e.g. during Vercel build)
     print(f"[DB] init skipped: {exc}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Auth helper
+#  Auth
 # ─────────────────────────────────────────────────────────────────────────────
 
-def check_admin(data: dict) -> bool:
+def check_admin(data):
     return (
         data.get("username") == ADMIN_USERNAME
         and data.get("password") == ADMIN_PASSWORD
@@ -110,15 +133,15 @@ def check_admin(data: dict) -> bool:
 
 @app.route("/")
 def index():
-    return send_from_directory("templates", "index.html")
+    return send_from_directory(os.path.join(BASE_DIR, "templates"), "index.html")
 
 
 @app.route("/admin")
 def admin_page():
-    return send_from_directory("templates", "admin.html")
+    return send_from_directory(os.path.join(BASE_DIR, "templates"), "admin.html")
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  API: submit a complaint  (public)
+#  API: submit complaint  (public)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route("/submit_complaint", methods=["POST"])
@@ -132,7 +155,6 @@ def submit_complaint():
     name         = None if is_anonymous else (data.get("name")  or "").strip() or None
     email        = None if is_anonymous else (data.get("email") or "").strip() or None
 
-    # ── Validation ──────────────────────────────────────────────────────────
     if not department:
         return jsonify({"error": "Department is required."}), 400
     if not title:
@@ -144,30 +166,29 @@ def submit_complaint():
     if len(description) > 5000:
         return jsonify({"error": "Description must be 5,000 characters or fewer."}), 400
 
-    # ── Insert (parameterised → no SQL injection) ────────────────────────────
     conn = get_db()
     cur  = conn.cursor()
     cur.execute(
         """
         INSERT INTO complaints (name, email, department, title, description, status, created_at)
         VALUES (%s, %s, %s, %s, %s, 'pending', NOW())
-        RETURNING id, created_at;
+        RETURNING id, created_at
         """,
         (name, email, department, title, description),
     )
-    row = cur.fetchone()
+    row = fetchone_as_dict(cur)
     conn.commit()
     cur.close()
     conn.close()
 
     return jsonify({
-        "message": "Complaint submitted successfully.",
+        "message":    "Complaint submitted successfully.",
         "id":         row["id"],
-        "created_at": row["created_at"].isoformat(),
+        "created_at": str(row["created_at"]),
     }), 201
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  API: list complaints  (admin only)
+#  API: list complaints  (admin)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route("/complaints", methods=["POST"])
@@ -194,21 +215,18 @@ def get_complaints():
     conn = get_db()
     cur  = conn.cursor()
     cur.execute(query, params)
-    rows = cur.fetchall()
+    rows = fetchall_as_dicts(cur)
     cur.close()
     conn.close()
 
-    result = []
     for r in rows:
-        c = dict(r)
-        if c.get("created_at"):
-            c["created_at"] = c["created_at"].isoformat()
-        result.append(c)
+        if r.get("created_at"):
+            r["created_at"] = str(r["created_at"])
 
-    return jsonify({"complaints": result}), 200
+    return jsonify({"complaints": rows}), 200
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  API: resolve / re-open a complaint  (admin only)
+#  API: resolve / re-open  (admin)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route("/resolve/<int:complaint_id>", methods=["PUT"])
@@ -224,10 +242,10 @@ def resolve_complaint(complaint_id):
     conn = get_db()
     cur  = conn.cursor()
     cur.execute(
-        "UPDATE complaints SET status = %s WHERE id = %s RETURNING id;",
+        "UPDATE complaints SET status = %s WHERE id = %s RETURNING id",
         (new_status, complaint_id),
     )
-    row = cur.fetchone()
+    row = fetchone_as_dict(cur)
     conn.commit()
     cur.close()
     conn.close()
@@ -238,7 +256,7 @@ def resolve_complaint(complaint_id):
     return jsonify({"message": f"Complaint #{complaint_id} marked as {new_status}."}), 200
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  API: delete a complaint  (admin only)
+#  API: delete  (admin)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route("/delete/<int:complaint_id>", methods=["DELETE"])
@@ -249,8 +267,8 @@ def delete_complaint(complaint_id):
 
     conn = get_db()
     cur  = conn.cursor()
-    cur.execute("DELETE FROM complaints WHERE id = %s RETURNING id;", (complaint_id,))
-    row = cur.fetchone()
+    cur.execute("DELETE FROM complaints WHERE id = %s RETURNING id", (complaint_id,))
+    row = fetchone_as_dict(cur)
     conn.commit()
     cur.close()
     conn.close()
@@ -261,7 +279,7 @@ def delete_complaint(complaint_id):
     return jsonify({"message": f"Complaint #{complaint_id} deleted."}), 200
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  API: admin login  (verify credentials only — no session/token)
+#  API: admin login check
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route("/admin/login", methods=["POST"])
@@ -272,8 +290,7 @@ def admin_login():
     return jsonify({"error": "Invalid credentials."}), 401
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Local dev entry point
-#  Run with:  python app.py
+#  Local dev
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
